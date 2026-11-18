@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII Zen Garden</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Gaegu:wght@700&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #3b2a1e; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: none; }
+  .bar { position: fixed; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  #tools { left: 8px; right: 8px; bottom: 12px; }
+  .bar button, .snd {
+    font: 700 18px 'Gaegu', ui-monospace, monospace; color: #fff1dc; background: rgba(40, 26, 16, .78);
+    border: 1px dashed rgba(255, 225, 185, .4); border-radius: 18px; padding: 3px 13px 5px; cursor: pointer;
+  }
+  .bar button.on { background: rgba(170, 120, 70, .55); border: 1px solid rgba(255, 230, 195, .85); }
+  .bar button small { opacity: .55; font-size: 13px; }
+  .snd { display: flex; align-items: center; gap: 8px; cursor: default; }
+  .snd span { min-width: 72px; }
+  #vol { width: 90px; accent-color: #c9a26b; }
+  #count { position: fixed; top: 10px; right: 14px; font: 700 20px 'Gaegu', ui-monospace, monospace; color: #fff1dc;
+    background: rgba(40, 26, 16, .65); padding: 2px 14px 4px; border-radius: 16px; }
+  #clock { position: fixed; top: 10px; left: 14px; font: 700 20px 'Gaegu', ui-monospace, monospace; color: #fff1dc;
+    background: rgba(40, 26, 16, .65); padding: 2px 14px 4px; border-radius: 16px; }
+  #toast { position: fixed; left: 50%; top: 52px; transform: translate(-50%, -20px); opacity: 0; pointer-events: none;
+    font: 700 21px 'Gaegu', ui-monospace, monospace; color: #fff6e8; background: rgba(90, 62, 38, .9);
+    padding: 4px 16px 6px; border-radius: 20px; transition: opacity .4s, transform .4s; white-space: nowrap; }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  @media (max-width: 700px) { #clock, #count { font-size: 16px; padding: 1px 10px 3px; top: 6px; } #clock { left: 8px; } #count { right: 8px; } .bar { gap: 5px; } #tools { bottom: 8px; } .bar button, .snd { font-size: 15px; padding: 2px 9px 4px; } .bar button small { display: none; } #vol { width: 66px; } .snd span { min-width: 56px; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="clock"></div>
+<div id="count"></div>
+<div class="bar" id="tools">
+  <button data-tool="rake" class="on">rake <small>1</small></button>
+  <button data-tool="fine">fine rake <small>2</small></button>
+  <button data-tool="smooth">smooth <small>3</small></button>
+  <button id="leavesBtn">fresh leaves</button>
+  <button id="resetBtn">start over</button>
+  <label class="snd"><span id="sndLbl">sound off</span><input id="vol" type="range" min="0" max="1" step="0.05" value="0" aria-label="sound volume"></label>
+</div>
+<div id="toast"></div>
+<script>
+(() => {
+  const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+  const STORE = 'ascii-zen-garden-v1';
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORE) || '{}') || {}; } catch (e) {}
+  const prefs = Object.assign({ volume: 0, seed: (Math.random() * 1e9) | 0 }, saved.prefs || {});
+
+  // ---------- helpers ----------
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  function seeded(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  const mixCache = new Map();
+  function mix(a, b, t) {
+    t = Math.max(0, Math.min(1, Math.round(t * 20) / 20)); if (t === 0) return a; if (t === 1) return b;
+    const k = a + b + t; let v = mixCache.get(k);
+    if (!v) { const A = parseInt(a.slice(1), 16), B = parseInt(b.slice(1), 16);
+      const f = s => Math.round(((A >> s) & 255) + (((B >> s) & 255) - ((A >> s) & 255)) * t).toString(16).padStart(2, '0');
+      v = '#' + f(16) + f(8) + f(0); mixCache.set(k, v); }
+    return v;
+  }
+
+  // ---------- grid ----------
+  const FONT_PX = 12;
+  let cw, ch, cols, rows, cellCh, cellCol, cellPri;
+  function put(gx, gy, c, col, pri) { gx |= 0; gy |= 0; if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) return; const i = gy * cols + gx; if (pri > cellPri[i]) { cellPri[i] = pri; cellCh[i] = c; cellCol[i] = col; } }
+
+  // ---------- garden layout ----------
+  // G = garden inside the frame (in cells). groove: 0 flat, 1 '-', 2 '|', 3 '/', 4 '\'; tone: 0 groove (dark), 1 ridge (light)
+  let G, groove, ridge, blocked, speck, rocks = [], trees = [], moss = [], stones = [];
+  const SAND = '#e8d8b8', SAND_DK = '#a88d62', SAND_LT = '#fff8ea', FRAME = '#6b4a32', FRAME_DK = '#4e3423';
+  function layout() {
+    const top = 3, bottom = Math.ceil((document.getElementById('tools').offsetHeight + 22) / ch);
+    G = { x0: 3, x1: cols - 4, y0: top + 1, y1: rows - bottom - 1 };
+    const W = G.x1 - G.x0 + 1, H = G.y1 - G.y0 + 1, n = W * H;
+    groove = new Uint8Array(n); ridge = new Uint8Array(n); blocked = new Uint8Array(n);
+    speck = Float32Array.from({ length: n }, () => Math.random());
+    const R = seeded(prefs.seed + cols * 7 + rows * 131);
+    const area = W * H, place = [];
+    const free = (x, y, r) => place.every(p => Math.hypot((p.x - x) * cw, (p.y - y) * ch) > (p.r + r) * cw * 1.25) && x - r > G.x0 + 2 && x + r < G.x1 - 2 && y - r * cw / ch > G.y0 + 1 && y + r * cw / ch < G.y1 - 1;
+    // rocks
+    rocks = [];
+    const nRocks = Math.max(3, Math.min(6, Math.round(area / 1500)));
+    for (let k = 0, tries = 0; k < nRocks && tries < 300; tries++) {
+      const r = (innerWidth < 700 ? 3 : 4) + R() * (innerWidth < 700 ? 3 : 5), x = G.x0 + R() * W, y = G.y0 + R() * H;
+      if (!free(x, y, r)) continue;
+      rocks.push({ x, y, r, sq: 0.7 + R() * 0.4, rot: R() * 6, bumps: [R(), R(), R()] }); place.push({ x, y, r }); k++;
+    }
+    // little trees: maples (red/orange) and a pine
+    trees = [];
+    const kinds = ['maple', 'maple', 'pine'];
+    for (let k = 0, tries = 0; k < kinds.length && tries < 300; tries++) {
+      const r = (kinds[k] === 'pine' ? 5 : 6.5) + R() * 3, x = G.x0 + R() * W, y = G.y0 + R() * H;
+      if (!free(x, y, r)) continue;
+      trees.push({ x, y, r, kind: kinds[k], seed: R() * 10 }); place.push({ x, y, r }); k++;
+    }
+    // a little path of flat stepping stones
+    stones = [];
+    const sy = G.y0 + H * (0.25 + R() * 0.5);
+    for (let k = 0; k < 6; k++) {
+      const x = G.x0 + W * (0.12 + k * 0.15) + R() * 3, y = sy + Math.sin(k * 1.3) * H * 0.08;
+      if (free(x, y, 2.4)) { stones.push({ x, y, r: 2.3 + R() * 0.6 }); place.push({ x, y, r: 2.4 }); }
+    }
+    // mark what the rake can't go over
+    const mark = (cx, cy, rx, ry) => { for (let y = Math.floor(cy - ry - 1); y <= cy + ry + 1; y++) for (let x = Math.floor(cx - rx - 1); x <= cx + rx + 1; x++) {
+      if (x < G.x0 || y < G.y0 || x > G.x1 || y > G.y1) continue;
+      if (Math.hypot((x + 0.5 - cx) / rx, (y + 0.5 - cy) / ry) <= 1) blocked[(y - G.y0) * W + (x - G.x0)] = 1; } };
+    for (const r of rocks) mark(r.x, r.y, r.r * 1.05, r.r * r.sq * cw / ch * 1.05);
+    for (const t of trees) mark(t.x, t.y, t.r * 0.55, t.r * 0.55 * cw / ch);
+    for (const s of stones) mark(s.x, s.y, s.r * 1.2, s.r * 0.7 * cw / ch);
+    // moss tufts around the rocks
+    moss = [];
+    for (const r of rocks) for (let k = 0; k < 16; k++) {
+      const a = R() * 6.28, d = r.r * (1.05 + R() * 0.35);
+      moss.push({ x: Math.round(r.x + Math.cos(a) * d), y: Math.round(r.y + Math.sin(a) * d * r.sq * cw / ch), c: ['"', ',', "'", '`'][R() * 4 | 0], col: R() < 0.5 ? '#7f9a54' : '#97b062' });
+    }
+    // restore a saved garden if it matches this screen
+    if (saved.garden && saved.garden.cols === cols && saved.garden.rows === rows && saved.garden.seed === prefs.seed) {
+      const g = saved.garden.g || '';
+      for (let i = 0; i < n && i < g.length; i++) { const v = g.charCodeAt(i) - 48; groove[i] = v >> 1; ridge[i] = v & 1; }
+      leaves.length = 0; for (const L of saved.garden.leaves || []) leaves.push(makeLeaf(L.x * cw, L.y * ch, L.k));
+    } else if (!leaves.length) scatterLeaves(Math.round(area / 150));
+    updateCount();
+  }
+  function resize() {
+    const dpr = devicePixelRatio || 1;
+    canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.font = `${FONT_PX}px ui-monospace, Menlo, Consolas, monospace`; ctx.textBaseline = 'top';
+    cw = ctx.measureText('M').width; ch = FONT_PX;
+    cols = Math.ceil(innerWidth / cw); rows = Math.ceil(innerHeight / ch);
+    const n = cols * rows; cellCh = new Array(n); cellCol = new Array(n); cellPri = new Float32Array(n);
+    layout();
+  }
+  const gi = (x, y) => (x < G.x0 || y < G.y0 || x > G.x1 || y > G.y1) ? -1 : (y - G.y0) * (G.x1 - G.x0 + 1) + (x - G.x0);
+
+  // ---------- leaves ----------
+  const leaves = [], falling = [];
+  const LEAF = [{ c: '&', col: '#d9542b' }, { c: '%', col: '#e8862e' }, { c: '*', col: '#e9b23a' }, { c: '@', col: '#b5452a' }, { c: '&', col: '#a8632f' }, { c: '*', col: '#f0a23a' }];
+  function makeLeaf(x, y, k) { k = k ?? (Math.random() * LEAF.length | 0); return { x, y, vx: 0, vy: 0, k, gone: 0 }; }
+  function scatterLeaves(n) {
+    for (let i = 0; i < n; i++) {
+      for (let tries = 0; tries < 20; tries++) {
+        const x = rnd(G.x0 + 1, G.x1) * cw, y = rnd(G.y0 + 1, G.y1) * ch, k = gi(Math.floor(x / cw), Math.floor(y / ch));
+        if (k >= 0 && !blocked[k]) { leaves.push(makeLeaf(x, y)); break; }
+      }
+    }
+  }
+  let cleanedToast = false;
+  function updateLeaves() {
+    for (let i = leaves.length - 1; i >= 0; i--) {
+      const L = leaves[i];
+      if (L.gone) { L.gone++; L.x += L.vx; L.y += L.vy; if (L.gone > 40) { leaves.splice(i, 1); updateCount(); } continue; }
+      if (Math.abs(L.vx) + Math.abs(L.vy) < 0.02) continue;
+      const nx = L.x + L.vx, ny = L.y + L.vy, k = gi(Math.floor(nx / cw), Math.floor(ny / ch));
+      if (k >= 0 && blocked[k]) { L.vx *= -0.4; L.vy *= -0.4; }        // bump off rocks and trees
+      else { L.x = nx; L.y = ny; }
+      L.vx *= 0.88; L.vy *= 0.88;
+      // swept off the edge of the garden: gone!
+      if (L.x < G.x0 * cw || L.x > (G.x1 + 1) * cw || L.y < G.y0 * ch || L.y > (G.y1 + 1) * ch) { L.gone = 1; sfx.whisk(); }
+    }
+    // now and then a leaf drifts down from a maple
+    if (Math.random() < 0.004) {
+      const t = trees.filter(t => t.kind === 'maple')[Math.random() * 2 | 0];
+      if (t) falling.push({ x: (t.x + rnd(-t.r, t.r)) * cw, y: (t.y + rnd(-t.r, t.r) * cw / ch) * ch, tx: (t.x + rnd(-t.r * 3, t.r * 3)) * cw, ty: (t.y + rnd(-t.r * 2, t.r * 2) * cw / ch) * ch, t: 0, k: Math.random() * LEAF.length | 0 });
+    }
+    for (let i = falling.length - 1; i >= 0; i--) {
+      const f = falling[i]; f.t++;
+      if (f.t > 160) {
+        falling.splice(i, 1);
+        const k = gi(Math.floor(f.tx / cw), Math.floor(f.ty / ch));
+        if (k >= 0 && !blocked[k]) { leaves.push(makeLeaf(f.tx, f.ty, f.k)); updateCount(); }
+      }
+    }
+    const left = leaves.filter(L => !L.gone).length;
+    if (left === 0 && !cleanedToast) { cleanedToast = true; toast('the garden is clean ✿ now rake some patterns'); sfx.chime(); }
+    if (left > 3) cleanedToast = false;
+  }
+  const countEl = document.getElementById('count');
+  function updateCount() { const n = leaves.filter(L => !L.gone).length; countEl.textContent = n ? (innerWidth < 700 ? `${n} leaves` : `${n} leaves to rake`) : 'all clean ✿'; }
+
+  // ---------- tools ----------
+  let tool = 'rake', hover = null, lastDir = 0, dragging = false, lastP = null, rakeSpeed = 0;
+  const TOOL = { rake: { tines: 5 }, fine: { tines: 3 }, smooth: { tines: 4 } };
+  function strokeSegment(x0, y0, x1, y1) {
+    const dx = x1 - x0, dy = y1 - y0, len = Math.hypot(dx, dy);
+    if (len < 0.5) return 0;
+    const ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
+    const a = Math.atan2(dy, dx), A = ((a % Math.PI) + Math.PI) % Math.PI;     // 0..π
+    const dirCode = A < Math.PI / 8 || A > Math.PI * 7 / 8 ? 1 : (A > Math.PI * 3 / 8 && A < Math.PI * 5 / 8) ? 2 : A < Math.PI / 2 ? 4 : 3;
+    const tsp = Math.abs(nx) * cw + Math.abs(ny) * ch;                          // one cell across the rake
+    const half = TOOL[tool].tines * tsp * (tool === 'fine' ? 0.5 : 0.5);
+    const minx = Math.floor((Math.min(x0, x1) - half) / cw) - 1, maxx = Math.ceil((Math.max(x0, x1) + half) / cw) + 1;
+    const miny = Math.floor((Math.min(y0, y1) - half) / ch) - 1, maxy = Math.ceil((Math.max(y0, y1) + half) / ch) + 1;
+    let touched = 0;
+    for (let gy = miny; gy <= maxy; gy++) for (let gx = minx; gx <= maxx; gx++) {
+      const k = gi(gx, gy); if (k < 0 || blocked[k]) continue;
+      const px = (gx + 0.5) * cw - x0, py = (gy + 0.5) * ch - y0;
+      const along = px * ux + py * uy, d = px * nx + py * ny;
+      if (along < -tsp * 0.5 || along > len + tsp * 0.5 || Math.abs(d) > half) continue;
+      if (tool === 'smooth') { if (groove[k]) touched++; groove[k] = 0; continue; }
+      const t = Math.floor((d + half) / tsp + 0.5) % 2;
+      if (groove[k] !== dirCode || ridge[k] !== t) touched++;
+      groove[k] = dirCode; ridge[k] = t;
+    }
+    // the rake pushes leaves along
+    for (const L of leaves) {
+      if (L.gone) continue;
+      const px = L.x - x0, py = L.y - y0, along = px * ux + py * uy, d = px * nx + py * ny;
+      if (along > -tsp && along < len + tsp * 2.5 && Math.abs(d) < half + 4) {
+        // carried along in front of the rake (and spilling a little off its sides)
+        const k2 = gi(Math.floor((L.x + dx) / cw), Math.floor((L.y + dy) / ch));
+        if (k2 < 0 || !blocked[k2]) { L.x += dx * 0.92; L.y += dy * 0.92; }
+        L.vx = ux * Math.min(4, len) * 0.35 + nx * Math.sign(d) * 0.2; L.vy = uy * Math.min(4, len) * 0.35 + ny * Math.sign(d) * 0.2;
+        if (Math.random() < 0.05) sfx.rustle();
+      }
+    }
+    lastDir = a;
+    return touched;
+  }
+
+  // ---------- drawing ----------
+  const GROOVE_CH = ['', '-', '|', '/', '\\'];
+  function drawRock(r) {
+    const ry = r.r * r.sq * cw / ch;
+    for (let y = Math.floor(r.y - ry - 1); y <= r.y + ry + 1; y++) for (let x = Math.floor(r.x - r.r - 1); x <= r.x + r.r + 1; x++) {
+      const u = (x + 0.5 - r.x) / r.r, v = (y + 0.5 - r.y) / ry, a = Math.atan2(v, u);
+      const edge = 1 + 0.08 * Math.sin(a * 3 + r.bumps[0] * 6) + 0.06 * Math.sin(a * 5 + r.bumps[1] * 6);
+      const d = Math.hypot(u, v) / edge; if (d > 1) continue;
+      const light = -u * 0.5 - v * 0.7;                                     // lit from the top-left
+      const col = d > 0.85 ? '#6d6a66' : light > 0.35 ? '#c9c4bb' : light > 0 ? '#a8a39a' : '#8b867e';
+      const c = d > 0.85 ? 'o' : light > 0.35 ? '@' : d < 0.5 ? '#' : '%';
+      const mossy = v < -0.2 && Math.sin(x * 2.1 + y * 3.7 + r.bumps[2] * 9) > 0.7;
+      put(x, y, mossy ? '"' : c, mossy ? '#89a35a' : col, 300);
+    }
+    // a soft shadow on the sand, bottom right
+    for (let y = Math.floor(r.y - ry); y <= r.y + ry + 2; y++) for (let x = Math.floor(r.x - r.r); x <= r.x + r.r + 2; x++) {
+      const d = Math.hypot((x + 0.5 - r.x - 1.2) / r.r, (y + 0.5 - r.y - 0.8) / ry); if (d < 1.08) shadowCells.push([x, y]);
+    }
+  }
+  function drawTree(t, time) {
+    const ry = t.r * cw / ch;
+    const pal = t.kind === 'pine' ? ['#3f6b3e', '#4f8a4a', '#65a05a', '#87ba6c'] : ['#a93a22', '#d4532b', '#ea7b32', '#f3a845'];
+    const sway = Math.sin(time * 0.0008 + t.seed) * 0.3;
+    for (let y = Math.floor(t.y - ry - 1); y <= t.y + ry + 1; y++) for (let x = Math.floor(t.x - t.r - 1); x <= t.x + t.r + 1; x++) {
+      const u = (x + 0.5 - t.x - sway) / t.r, v = (y + 0.5 - t.y) / ry, a = Math.atan2(v, u);
+      // puffy clumps of leaves (maple) or a star of needles (pine)
+      const lobes = t.kind === 'pine' ? 0.78 + 0.22 * Math.abs(Math.cos(a * 4)) : 0.85 + 0.15 * Math.sin(a * 6 + t.seed) + 0.06 * Math.sin(a * 11);
+      const d = Math.hypot(u, v) / lobes; if (d > 1) continue;
+      const n = Math.sin(x * 1.7 + y * 2.3 + t.seed * 5) * 0.5 + 0.5, light = -u * 0.4 - v * 0.6 + n * 0.3;
+      const col = pal[Math.max(0, Math.min(3, Math.floor((light + 0.6) * 2.4)))];
+      const c = t.kind === 'pine' ? (d > 0.8 ? '*' : n > 0.5 ? '^' : '*') : (d > 0.85 ? '*' : n > 0.6 ? '&' : n > 0.3 ? '%' : '@');
+      put(x, y, c, col, 400);
+    }
+    for (let y = Math.floor(t.y - ry); y <= t.y + ry + 2; y++) for (let x = Math.floor(t.x - t.r); x <= t.x + t.r + 2; x++) {
+      if (Math.hypot((x + 0.5 - t.x - 1.5) / t.r, (y + 0.5 - t.y - 1) / ry) < 1) shadowCells.push([x, y]);
+    }
+  }
+  let shadowCells = [];
+  function draw(time) {
+    cellPri.fill(0); shadowCells = [];
+    // wood around the garden
+    ctx.fillStyle = '#3b2a1e'; ctx.fillRect(0, 0, innerWidth, innerHeight);
+    ctx.fillStyle = SAND; ctx.fillRect(G.x0 * cw, G.y0 * ch, (G.x1 - G.x0 + 1) * cw, (G.y1 - G.y0 + 1) * ch);
+    for (let y = G.y0 - 1; y <= G.y1 + 1; y++) for (let x = G.x0 - 2; x <= G.x1 + 2; x++) {
+      if (x >= G.x0 && x <= G.x1 && y >= G.y0 && y <= G.y1) continue;
+      put(x, y, y === G.y0 - 1 || y === G.y1 + 1 ? '=' : '#', (x + y) % 3 ? FRAME : FRAME_DK, 50);
+    }
+    // the sand: raked grooves, or soft flat sand with tiny specks
+    const W = G.x1 - G.x0 + 1;
+    for (let y = G.y0; y <= G.y1; y++) for (let x = G.x0; x <= G.x1; x++) {
+      const k = (y - G.y0) * W + (x - G.x0);
+      if (groove[k]) put(x, y, GROOVE_CH[groove[k]], ridge[k] ? SAND_LT : SAND_DK, 100);
+      else if (speck[k] < 0.12) put(x, y, speck[k] < 0.04 ? ',' : '.', speck[k] < 0.06 ? '#d4c29e' : '#dccba8', 90);
+    }
+    for (const s of stones) {
+      const ry = s.r * 0.7 * cw / ch;
+      for (let y = Math.floor(s.y - ry); y <= s.y + ry; y++) for (let x = Math.floor(s.x - s.r * 1.2); x <= s.x + s.r * 1.2; x++) {
+        const d = Math.hypot((x + 0.5 - s.x) / (s.r * 1.2), (y + 0.5 - s.y) / ry); if (d > 1) continue;
+        put(x, y, d > 0.72 ? 'o' : d < 0.35 ? '@' : '%', d > 0.72 ? '#8f897f' : d < 0.35 ? '#c8c1b4' : '#b0a99c', 250);
+      }
+    }
+    for (const r of rocks) drawRock(r);
+    for (const m of moss) { const k = gi(m.x, m.y); if (k >= 0 && !blocked[k]) put(m.x, m.y, m.c, m.col, 260); }
+    // leaves on the sand
+    for (const L of leaves) {
+      const lf = LEAF[L.k];
+      const col = L.gone ? mix(lf.col, SAND, L.gone / 40) : lf.col;
+      put(Math.floor(L.x / cw), Math.floor(L.y / ch), lf.c, col, 350);
+    }
+    for (const t of trees) drawTree(t, time);
+    // leaves drifting down from the maples (they grow as they get "closer" to the sand)
+    for (const f of falling) {
+      const p = f.t / 160, x = f.x + (f.tx - f.x) * p + Math.sin(f.t * 0.12) * 10, y = f.y + (f.ty - f.y) * p;
+      put(Math.floor(x / cw), Math.floor(y / ch), p < 0.5 ? '.' : LEAF[f.k].c, LEAF[f.k].col, 500);
+    }
+    // the rake, following your hand
+    if (hover) drawRake(hover.x, hover.y);
+
+    // shadows first, then all the characters
+    for (const o of [...rocks, ...trees]) {
+      const x = (o.x + 1.4) * cw, y = (o.y + 0.9) * ch, rx = o.r * cw * 1.05, ry = o.r * cw * (o.sq || 1) * 1.05;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, rx);
+      g.addColorStop(0, 'rgba(110, 85, 50, .22)'); g.addColorStop(0.7, 'rgba(110, 85, 50, .12)'); g.addColorStop(1, 'rgba(110, 85, 50, 0)');
+      ctx.save(); ctx.translate(x, y); ctx.scale(1, ry / rx); ctx.translate(-x, -y); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, rx, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    }
+    const buckets = new Map();
+    for (let i = 0; i < cellPri.length; i++) { if (cellPri[i] <= 0) continue; let b = buckets.get(cellCol[i]); if (!b) buckets.set(cellCol[i], b = []); b.push(i); }
+    for (const [col, arr] of buckets) { ctx.fillStyle = col; for (const i of arr) ctx.fillText(cellCh[i], (i % cols) * cw, Math.floor(i / cols) * ch); }
+    // a soft warm light over the garden
+    const g = ctx.createRadialGradient(innerWidth * 0.3, innerHeight * 0.2, 0, innerWidth * 0.3, innerHeight * 0.2, innerWidth * 0.9);
+    g.addColorStop(0, 'rgba(255, 240, 210, .10)'); g.addColorStop(1, 'rgba(60, 40, 20, .12)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, innerWidth, innerHeight);
+  }
+  function drawRake(x, y) {
+    const gx = Math.floor(x / cw), gy = Math.floor(y / ch);
+    const a = lastDir, nx = -Math.sin(a), ny = Math.cos(a), n = TOOL[tool].tines;
+    const tsp = Math.abs(nx) * cw + Math.abs(ny) * ch;
+    const head = tool === 'smooth' ? '=' : (Math.abs(nx) > Math.abs(ny) ? '-' : '|');
+    const tine = tool === 'smooth' ? '=' : 'E';
+    for (let k = -n; k <= n; k++) {
+      const off = k * tsp * 0.5;
+      put(Math.floor((x + nx * off) / cw), Math.floor((y + ny * off) / ch), k % 2 === 0 ? (tool === 'smooth' ? '=' : 'H') : head, tool === 'smooth' ? '#d9c79f' : '#7a5232', 900);
+    }
+    // the handle, trailing behind the head
+    for (let k = 1; k <= 9; k++) put(Math.floor((x - Math.cos(a) * k * cw * 0.9 - 4) / cw), Math.floor((y - Math.sin(a) * k * ch * 0.6 - 4) / ch), '#', '#a2774e', 890);
+  }
+
+  // ---------- sound (all made in the browser) ----------
+  let actx = null, master = null, scratchGain = null, scratchFilter = null, noiseBuf = null;
+  function ensureAudio() {
+    if (actx) return actx;
+    try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return null; }
+    master = actx.createGain(); master.gain.value = 0; master.connect(actx.destination);
+    noiseBuf = actx.createBuffer(1, actx.sampleRate * 2, actx.sampleRate);
+    const nd = noiseBuf.getChannelData(0);
+    // grainy noise: lots of tiny clicks, like sand under a rake
+    for (let i = 0; i < nd.length; i++) nd[i] = (Math.random() * 2 - 1) * (Math.random() < 0.3 ? 1 : 0.25);
+    const src = actx.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+    scratchFilter = actx.createBiquadFilter(); scratchFilter.type = 'bandpass'; scratchFilter.frequency.value = 2200; scratchFilter.Q.value = 0.8;
+    scratchGain = actx.createGain(); scratchGain.gain.value = 0;
+    src.connect(scratchFilter).connect(scratchGain).connect(master); src.start();
+    // a soft breeze
+    const wind = actx.createBufferSource(); wind.buffer = noiseBuf; wind.loop = true;
+    const wl = actx.createBiquadFilter(); wl.type = 'lowpass'; wl.frequency.value = 350;
+    const wg = actx.createGain(); wg.gain.value = 0.05;
+    wind.connect(wl).connect(wg).connect(master); wind.start(0, 0.5);
+    // wind chimes and the bamboo fountain now and then
+    const chimes = () => { if (live() && Math.random() < 0.6) sfx.chime(); setTimeout(chimes, rnd(9000, 20000)); };
+    const bamboo = () => { if (live()) sfx.bamboo(); setTimeout(bamboo, rnd(30000, 60000)); };
+    setTimeout(chimes, 4000); setTimeout(bamboo, 12000);
+    return actx;
+  }
+  const live = () => prefs.volume > 0 && actx && actx.state === 'running';
+  function tone(f, vol, dur, rise = 1, when = 0, type = 'sine') {
+    if (!live()) return;
+    const t = actx.currentTime + when, o = actx.createOscillator(), g = actx.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t); o.frequency.exponentialRampToValueAtTime(f * rise, t + dur);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + Math.min(0.01, dur / 4)); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(master); o.start(t); o.stop(t + dur + 0.05);
+  }
+  function burst(freq, vol, dur, type = 'bandpass') {
+    if (!live()) return;
+    const t = actx.currentTime, s = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+    s.buffer = noiseBuf; f.type = type; f.frequency.value = freq; f.Q.value = 0.9;
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f).connect(g).connect(master); s.start(t, Math.random()); s.stop(t + dur + 0.02);
+  }
+  const sfx = {
+    rustle: () => { burst(rnd(3000, 6000), 0.12, rnd(0.08, 0.16), 'highpass'); },
+    whisk: () => { burst(2500, 0.15, 0.25, 'highpass'); },
+    chime: () => { const notes = [1046.5, 1174.7, 1318.5, 1568, 1760]; for (let k = 0; k < 3; k++) tone(notes[Math.random() * 5 | 0], 0.05, 2.6, 1, k * rnd(0.15, 0.4)); },
+    bamboo: () => { burst(900, 0.3, 0.05); tone(420, 0.18, 0.12, 0.9, 0.005, 'triangle'); tone(140, 0.15, 0.25, 0.8, 0.01); setTimeout(() => burst(1400, 0.06, 0.6, 'lowpass'), 300); },
+  };
+  function setScratch(speed) {
+    if (!scratchGain) return;
+    const t = actx.currentTime;
+    const amt = tool === 'smooth' ? Math.min(0.25, speed * 0.02) : Math.min(0.5, speed * 0.035);
+    scratchGain.gain.setTargetAtTime(dragging ? amt : 0, t, 0.05);
+    scratchFilter.frequency.setTargetAtTime(tool === 'fine' ? 3400 : tool === 'smooth' ? 1200 : 2200 + speed * 40, t, 0.05);
+  }
+  const vol = document.getElementById('vol'), sndLbl = document.getElementById('sndLbl');
+  function applySound() {
+    sndLbl.textContent = prefs.volume > 0 ? `sound ${Math.round(prefs.volume * 100)}%` : 'sound off';
+    if (prefs.volume <= 0) { if (actx) master.gain.setTargetAtTime(0, actx.currentTime, 0.1); return; }
+    const a = ensureAudio(); if (!a) return; a.resume().catch(() => {});
+    master.gain.setTargetAtTime(prefs.volume * 1.1, a.currentTime, 0.15);
+  }
+  vol.value = prefs.volume;
+  vol.addEventListener('input', () => { prefs.volume = +vol.value; save(); applySound(); });
+  let lastVol = prefs.volume || 0.6;
+
+  // ---------- saving ----------
+  let saveTimer = null;
+  function save() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      let g = ''; for (let i = 0; i < groove.length; i++) g += String.fromCharCode(48 + (groove[i] << 1 | ridge[i]));
+      try { localStorage.setItem(STORE, JSON.stringify({ prefs, garden: { cols, rows, seed: prefs.seed, g,
+        leaves: leaves.filter(L => !L.gone).map(L => ({ x: +(L.x / cw).toFixed(2), y: +(L.y / ch).toFixed(2), k: L.k })) } })); } catch (e) {}
+    }, 400);
+  }
+
+  // ---------- toast & clock ----------
+  const toastEl = document.getElementById('toast'); let toastT;
+  function toast(m) { toastEl.textContent = m; toastEl.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove('show'), 2800); }
+  const clockEl = document.getElementById('clock');
+  const DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  function tick() { const d = new Date(); let h = d.getHours(); const ap = h >= 12 ? 'pm' : 'am'; h = h % 12 || 12;
+    clockEl.textContent = `${h}:${String(d.getMinutes()).padStart(2, '0')} ${ap}` + (innerWidth < 700 ? '' : ` · ${DAYS[d.getDay()]}`); }
+  tick(); setInterval(tick, 10000);
+
+  // ---------- loop ----------
+  let t0 = 0;
+  function frame(now) {
+    updateLeaves();
+    rakeSpeed *= 0.85; if (actx) setScratch(rakeSpeed);
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+  resize(); addEventListener('resize', resize);
+  applySound();
+  requestAnimationFrame(frame);
+
+  // ---------- input ----------
+  canvas.addEventListener('pointerdown', e => {
+    if (prefs.volume > 0) applySound();
+    dragging = true; lastP = { x: e.clientX, y: e.clientY }; hover = { ...lastP };
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', e => {
+    const p = { x: e.clientX, y: e.clientY };
+    hover = p;
+    if (!dragging || !lastP) return;
+    const d = Math.hypot(p.x - lastP.x, p.y - lastP.y);
+    if (d < 2) return;
+    strokeSegment(lastP.x, lastP.y, p.x, p.y);
+    rakeSpeed = Math.max(rakeSpeed * 0.6, d);
+    lastP = p;
+  });
+  const end = () => { if (dragging) save(); dragging = false; lastP = null; };
+  canvas.addEventListener('pointerup', end); canvas.addEventListener('pointercancel', end);
+  canvas.addEventListener('pointerleave', () => { if (!dragging) hover = null; });
+
+  function setTool(t) {
+    tool = t; document.querySelectorAll('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool === t));
+    toast({ rake: 'rake: wide, calm lines', fine: 'fine rake: thin little lines', smooth: 'smooth: flatten the sand' }[t]);
+  }
+  document.querySelectorAll('[data-tool]').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
+  document.getElementById('leavesBtn').addEventListener('click', () => {
+    const W = G.x1 - G.x0 + 1, H = G.y1 - G.y0 + 1;
+    scatterLeaves(Math.round(W * H / 170)); updateCount(); save(); toast('a gust of wind… fresh leaves!'); sfx.rustle(); sfx.rustle();
+  });
+  document.getElementById('resetBtn').addEventListener('click', () => {
+    groove.fill(0); ridge.fill(0); leaves.length = 0;
+    const W = G.x1 - G.x0 + 1, H = G.y1 - G.y0 + 1; scatterLeaves(Math.round(W * H / 150)); updateCount(); save();
+    toast('fresh, smooth sand'); sfx.chime();
+  });
+  addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k === '1') setTool('rake'); else if (k === '2') setTool('fine'); else if (k === '3') setTool('smooth');
+    else if (k === 'm') { if (prefs.volume > 0) { lastVol = prefs.volume; prefs.volume = 0; } else prefs.volume = lastVol; vol.value = prefs.volume; save(); applySound(); toast(prefs.volume > 0 ? 'sound on' : 'sound off'); }
+  });
+})();
+</script>
+</body>
+</html>
