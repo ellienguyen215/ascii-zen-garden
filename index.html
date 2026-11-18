@@ -9,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Gaegu:wght@700&display=swap" rel="stylesheet">
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #3b2a1e; }
-  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: none; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
   .bar { position: fixed; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: center; }
   #tools { left: 8px; right: 8px; bottom: 12px; }
   .bar button, .snd {
@@ -48,10 +48,11 @@
 <script>
 (() => {
   const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
-  const STORE = 'ascii-zen-garden-v1';
+  const STORE = 'ascii-zen-garden-v2';
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(STORE) || '{}') || {}; } catch (e) {}
   const prefs = Object.assign({ volume: 0, seed: (Math.random() * 1e9) | 0 }, saved.prefs || {});
+  try { const old = JSON.parse(localStorage.getItem('ascii-zen-garden-v1') || '{}'); if (old.prefs && saved.prefs === undefined) prefs.volume = old.prefs.volume || 0; } catch (e) {}
 
   // ---------- helpers ----------
   const rnd = (a, b) => a + Math.random() * (b - a);
@@ -66,67 +67,81 @@
     return v;
   }
 
-  // ---------- grid ----------
+  // ---------- grid of characters ----------
   const FONT_PX = 12;
   let cw, ch, cols, rows, cellCh, cellCol, cellPri;
   function put(gx, gy, c, col, pri) { gx |= 0; gy |= 0; if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) return; const i = gy * cols + gx; if (pri > cellPri[i]) { cellPri[i] = pri; cellCh[i] = c; cellCol[i] = col; } }
 
-  // ---------- garden layout ----------
-  // G = garden inside the frame (in cells). groove: 0 flat, 1 '-', 2 '|', 3 '/', 4 '\'; tone: 0 groove (dark), 1 ridge (light)
-  let G, groove, ridge, blocked, speck, rocks = [], trees = [], moss = [], stones = [];
-  const SAND = '#e8d8b8', SAND_DK = '#a88d62', SAND_LT = '#fff8ea', FRAME = '#6b4a32', FRAME_DK = '#4e3423';
+  // ---------- time of day ----------
+  function hourNow() { let o = null; try { o = localStorage.getItem('zen-hour'); } catch (e) {} if (o) return +o; const d = new Date(); return d.getHours() + d.getMinutes() / 60; }
+  function daylight() { const h = hourNow(); if (h >= 8 && h < 17) return 1; if (h >= 6 && h < 8) return (h - 6) / 2; if (h >= 17 && h < 19.5) return 1 - (h - 17) / 2.5; return 0; }
+  function warmth() { const h = hourNow(); return Math.max(0, 1 - Math.abs(h - 7) / 1.4) + Math.max(0, 1 - Math.abs(h - 18) / 1.4); }
+  let day = daylight(), warm = Math.min(1, warmth());
+
+  // ---------- the view: a sand garden seen from the front, in perspective ----------
+  // Ground coordinates: X (left/right, in "near pixels") and Z (depth: 1 = front edge, ZF = back edge).
+  let ZF = 4.2;
+  let yH, yB, cx, WN, DEPTH;      // horizon y, front edge y, centre x (px), front width (px), depth scale
+  function toScreen(X, z) { return { x: cx + X / z, y: yH + (yB - yH) / z }; }
+  function toGround(sx, sy) { if (sy <= yH + 1) return null; const z = (yB - yH) / (sy - yH); return { X: (sx - cx) * z, z }; }
+  // where the sand is (a trapezoid that narrows toward the back)
+  const halfW = () => WN * 0.5;
+  function onSand(X, z) { return z >= 1 && z <= ZF && Math.abs(X) <= halfW(); }
+  // physical ground position used for raking (so grooves have even spacing on the ground)
+  const gY = z => z * DEPTH;
+
+  // ---------- groove storage: a grid laid on the ground ----------
+  const GW = 220, GH = 130;
+  let groove = new Uint8Array(GW * GH), ridge = new Uint8Array(GW * GH), blockedG = new Uint8Array(GW * GH);
+  const gIndex = (X, z) => { const u = (X / WN + 0.5), v = (z - 1) / (ZF - 1); if (u < 0 || u >= 1 || v < 0 || v >= 1) return -1; return Math.floor(v * GH) * GW + Math.floor(u * GW); };
+  const gCenter = k => { const gu = k % GW, gv = Math.floor(k / GW); return { X: ((gu + 0.5) / GW - 0.5) * WN, z: 1 + (gv + 0.5) / GH * (ZF - 1) }; };
+
+  // ---------- scenery ----------
+  let rocks = [], trees = [], lantern = null, mtns = [], specks;
   function layout() {
-    const top = 3, bottom = Math.ceil((document.getElementById('tools').offsetHeight + 22) / ch);
-    G = { x0: 3, x1: cols - 4, y0: top + 1, y1: rows - bottom - 1 };
-    const W = G.x1 - G.x0 + 1, H = G.y1 - G.y0 + 1, n = W * H;
-    groove = new Uint8Array(n); ridge = new Uint8Array(n); blocked = new Uint8Array(n);
-    speck = Float32Array.from({ length: n }, () => Math.random());
-    const R = seeded(prefs.seed + cols * 7 + rows * 131);
-    const area = W * H, place = [];
-    const free = (x, y, r) => place.every(p => Math.hypot((p.x - x) * cw, (p.y - y) * ch) > (p.r + r) * cw * 1.25) && x - r > G.x0 + 2 && x + r < G.x1 - 2 && y - r * cw / ch > G.y0 + 1 && y + r * cw / ch < G.y1 - 1;
-    // rocks
-    rocks = [];
-    const nRocks = Math.max(3, Math.min(6, Math.round(area / 1500)));
-    for (let k = 0, tries = 0; k < nRocks && tries < 300; tries++) {
-      const r = (innerWidth < 700 ? 3 : 4) + R() * (innerWidth < 700 ? 3 : 5), x = G.x0 + R() * W, y = G.y0 + R() * H;
-      if (!free(x, y, r)) continue;
-      rocks.push({ x, y, r, sq: 0.7 + R() * 0.4, rot: R() * 6, bumps: [R(), R(), R()] }); place.push({ x, y, r }); k++;
+    const tall = innerHeight > innerWidth * 1.2;      // phones held upright
+    ZF = tall ? 2.5 : 4.2;
+    yH = Math.round(innerHeight * (tall ? 0.33 : 0.3));
+    const bottomBar = document.getElementById('tools').offsetHeight + 24;
+    yB = innerHeight - bottomBar;
+    cx = innerWidth / 2;
+    WN = Math.min(innerWidth * 0.98, (yB - yH) * 3.4);
+    DEPTH = (yB - yH) * 0.9;
+    const R = seeded(prefs.seed);
+    rocks = []; trees = []; blockedG.fill(0);
+    const taken = [];
+    const free = (X, z, r) => taken.every(o => Math.hypot(o.X - X, (o.z - z) * DEPTH) > (o.r + r) * 1.15);
+    const spot = (r, zMin, zMax, xSpread = 0.4) => {
+      for (let k = 0; k < 200; k++) { const z = zMin + R() * (zMax - zMin), X = (R() - 0.5) * 2 * halfW() * xSpread * 2 * 0.9; if (Math.abs(X) < halfW() - r * 1.2 && free(X, z, r)) return { X, z }; }
+      return null;
+    };
+    const sz = WN / 1000 * (tall ? 2.7 : 1.9);
+    // rocks, big and small
+    const nR = innerWidth < 700 ? 4 : 5;
+    for (let k = 0; k < nR; k++) {
+      const r = (k < 2 ? 60 : 30 + R() * 30) * sz * 1.1, p = spot(r, 1.25, ZF - 0.3, 0.5);
+      if (!p) continue;
+      rocks.push({ ...p, r, h: 0.55 + R() * 0.6, lean: (R() - 0.5) * 0.4, bump: [R() * 6, R() * 6], mossy: R() < 0.7 }); taken.push({ ...p, r });
     }
-    // little trees: maples (red/orange) and a pine
-    trees = [];
-    const kinds = ['maple', 'maple', 'pine'];
-    for (let k = 0, tries = 0; k < kinds.length && tries < 300; tries++) {
-      const r = (kinds[k] === 'pine' ? 5 : 6.5) + R() * 3, x = G.x0 + R() * W, y = G.y0 + R() * H;
-      if (!free(x, y, r)) continue;
-      trees.push({ x, y, r, kind: kinds[k], seed: R() * 10 }); place.push({ x, y, r }); k++;
+    // little trees: two maples and a pine, toward the back so you can rake in front of them
+    for (const kind of ['maple', 'pine', 'maple']) {
+      const r = (kind === 'pine' ? 90 : 115) * sz, p = spot(r * 0.5, Math.min(1.7, ZF - 0.6), Math.min(3.0, ZF - 0.15), 0.5);
+      if (!p) continue;
+      trees.push({ ...p, r, kind, seed: R() * 10 }); taken.push({ ...p, r: r * 0.5 });
     }
-    // a little path of flat stepping stones
-    stones = [];
-    const sy = G.y0 + H * (0.25 + R() * 0.5);
-    for (let k = 0; k < 6; k++) {
-      const x = G.x0 + W * (0.12 + k * 0.15) + R() * 3, y = sy + Math.sin(k * 1.3) * H * 0.08;
-      if (free(x, y, 2.4)) { stones.push({ x, y, r: 2.3 + R() * 0.6 }); place.push({ x, y, r: 2.4 }); }
+    // a stone lantern
+    const lp = spot(40 * sz, Math.min(1.5, ZF - 0.7), Math.min(2.6, ZF - 0.2), 0.5);
+    lantern = lp ? { ...lp, r: 28 * sz } : null; if (lp) taken.push({ ...lp, r: 30 * sz });
+    // mark the ground the rake can't go over
+    for (let k = 0; k < GW * GH; k++) {
+      const c = gCenter(k);
+      for (const o of [...rocks.map(r => ({ X: r.X, z: r.z, r: r.r * 1.05 })), ...trees.map(t => ({ X: t.X, z: t.z, r: t.r * 0.18 })), ...(lantern ? [{ X: lantern.X, z: lantern.z, r: lantern.r * 1.1 }] : [])])
+        if (Math.hypot(c.X - o.X, (c.z - o.z) * DEPTH) < o.r) { blockedG[k] = 1; break; }
     }
-    // mark what the rake can't go over
-    const mark = (cx, cy, rx, ry) => { for (let y = Math.floor(cy - ry - 1); y <= cy + ry + 1; y++) for (let x = Math.floor(cx - rx - 1); x <= cx + rx + 1; x++) {
-      if (x < G.x0 || y < G.y0 || x > G.x1 || y > G.y1) continue;
-      if (Math.hypot((x + 0.5 - cx) / rx, (y + 0.5 - cy) / ry) <= 1) blocked[(y - G.y0) * W + (x - G.x0)] = 1; } };
-    for (const r of rocks) mark(r.x, r.y, r.r * 1.05, r.r * r.sq * cw / ch * 1.05);
-    for (const t of trees) mark(t.x, t.y, t.r * 0.55, t.r * 0.55 * cw / ch);
-    for (const s of stones) mark(s.x, s.y, s.r * 1.2, s.r * 0.7 * cw / ch);
-    // moss tufts around the rocks
-    moss = [];
-    for (const r of rocks) for (let k = 0; k < 16; k++) {
-      const a = R() * 6.28, d = r.r * (1.05 + R() * 0.35);
-      moss.push({ x: Math.round(r.x + Math.cos(a) * d), y: Math.round(r.y + Math.sin(a) * d * r.sq * cw / ch), c: ['"', ',', "'", '`'][R() * 4 | 0], col: R() < 0.5 ? '#7f9a54' : '#97b062' });
-    }
-    // restore a saved garden if it matches this screen
-    if (saved.garden && saved.garden.cols === cols && saved.garden.rows === rows && saved.garden.seed === prefs.seed) {
-      const g = saved.garden.g || '';
-      for (let i = 0; i < n && i < g.length; i++) { const v = g.charCodeAt(i) - 48; groove[i] = v >> 1; ridge[i] = v & 1; }
-      leaves.length = 0; for (const L of saved.garden.leaves || []) leaves.push(makeLeaf(L.x * cw, L.y * ch, L.k));
-    } else if (!leaves.length) scatterLeaves(Math.round(area / 150));
-    updateCount();
+    // distant mountains
+    mtns = [];
+    for (let k = 0; k < 7; k++) mtns.push({ x: R() * innerWidth, w: innerWidth * (tall ? 0.5 + R() * 0.4 : 0.15 + R() * 0.25), h: innerHeight * (0.06 + R() * 0.1), far: R() < 0.5 });
+    specks = new Float32Array(GW * GH).map(() => Math.random());
   }
   function resize() {
     const dpr = devicePixelRatio || 1;
@@ -135,47 +150,42 @@
     cw = ctx.measureText('M').width; ch = FONT_PX;
     cols = Math.ceil(innerWidth / cw); rows = Math.ceil(innerHeight / ch);
     const n = cols * rows; cellCh = new Array(n); cellCol = new Array(n); cellPri = new Float32Array(n);
+    const firstTime = WN === undefined;
     layout();
+    if (firstTime) restore(); else for (const L of leaves) if (Math.abs(L.X) > halfW()) L.gone = 1;
+    updateCount();
   }
-  const gi = (x, y) => (x < G.x0 || y < G.y0 || x > G.x1 || y > G.y1) ? -1 : (y - G.y0) * (G.x1 - G.x0 + 1) + (x - G.x0);
 
-  // ---------- leaves ----------
+  // ---------- leaves (stored on the ground) ----------
   const leaves = [], falling = [];
   const LEAF = [{ c: '&', col: '#d9542b' }, { c: '%', col: '#e8862e' }, { c: '*', col: '#e9b23a' }, { c: '@', col: '#b5452a' }, { c: '&', col: '#a8632f' }, { c: '*', col: '#f0a23a' }];
-  function makeLeaf(x, y, k) { k = k ?? (Math.random() * LEAF.length | 0); return { x, y, vx: 0, vy: 0, k, gone: 0 }; }
+  const makeLeaf = (X, z, k) => ({ X, z, vx: 0, vz: 0, k: k ?? (Math.random() * LEAF.length | 0), gone: 0 });
   function scatterLeaves(n) {
-    for (let i = 0; i < n; i++) {
-      for (let tries = 0; tries < 20; tries++) {
-        const x = rnd(G.x0 + 1, G.x1) * cw, y = rnd(G.y0 + 1, G.y1) * ch, k = gi(Math.floor(x / cw), Math.floor(y / ch));
-        if (k >= 0 && !blocked[k]) { leaves.push(makeLeaf(x, y)); break; }
-      }
+    for (let i = 0; i < n; i++) for (let t = 0; t < 20; t++) {
+      const z = 1.05 + Math.random() * (ZF - 1.15), X = (Math.random() - 0.5) * 2 * halfW() * 0.97, k = gIndex(X, z);
+      if (k >= 0 && !blockedG[k]) { leaves.push(makeLeaf(X, z)); break; }
     }
   }
   let cleanedToast = false;
   function updateLeaves() {
     for (let i = leaves.length - 1; i >= 0; i--) {
       const L = leaves[i];
-      if (L.gone) { L.gone++; L.x += L.vx; L.y += L.vy; if (L.gone > 40) { leaves.splice(i, 1); updateCount(); } continue; }
-      if (Math.abs(L.vx) + Math.abs(L.vy) < 0.02) continue;
-      const nx = L.x + L.vx, ny = L.y + L.vy, k = gi(Math.floor(nx / cw), Math.floor(ny / ch));
-      if (k >= 0 && blocked[k]) { L.vx *= -0.4; L.vy *= -0.4; }        // bump off rocks and trees
-      else { L.x = nx; L.y = ny; }
-      L.vx *= 0.88; L.vy *= 0.88;
-      // swept off the edge of the garden: gone!
-      if (L.x < G.x0 * cw || L.x > (G.x1 + 1) * cw || L.y < G.y0 * ch || L.y > (G.y1 + 1) * ch) { L.gone = 1; sfx.whisk(); }
+      if (L.gone) { if (++L.gone > 40) { leaves.splice(i, 1); updateCount(); } continue; }
+      if (Math.abs(L.vx) + Math.abs(L.vz) * DEPTH < 0.03) continue;
+      const nX = L.X + L.vx, nz = L.z + L.vz, k = gIndex(nX, nz);
+      if (k >= 0 && blockedG[k]) { L.vx *= -0.4; L.vz *= -0.4; } else { L.X = nX; L.z = nz; }
+      L.vx *= 0.86; L.vz *= 0.86;
+      if (!onSand(L.X, L.z)) { L.gone = 1; sfx.whisk(); }
     }
-    // now and then a leaf drifts down from a maple
-    if (Math.random() < 0.004) {
-      const t = trees.filter(t => t.kind === 'maple')[Math.random() * 2 | 0];
-      if (t) falling.push({ x: (t.x + rnd(-t.r, t.r)) * cw, y: (t.y + rnd(-t.r, t.r) * cw / ch) * ch, tx: (t.x + rnd(-t.r * 3, t.r * 3)) * cw, ty: (t.y + rnd(-t.r * 2, t.r * 2) * cw / ch) * ch, t: 0, k: Math.random() * LEAF.length | 0 });
+    // maple leaves float down from the branches onto the sand
+    if (Math.random() < 0.005) {
+      const ms = trees.filter(t => t.kind === 'maple'), t = ms[Math.random() * ms.length | 0];
+      if (t) { const base = toScreen(t.X, t.z), R = t.r / t.z;
+        const X = t.X + rnd(-1, 1) * t.r * 1.6, z = Math.max(1.05, Math.min(ZF - 0.05, t.z + rnd(-0.5, 0.6)));
+        falling.push({ sx: base.x + rnd(-R, R), sy: base.y - R * 1.6 + rnd(-R * 0.4, R * 0.4), X, z, t: 0, dur: rnd(150, 240), k: Math.random() * LEAF.length | 0, ph: Math.random() * 6 }); }
     }
     for (let i = falling.length - 1; i >= 0; i--) {
-      const f = falling[i]; f.t++;
-      if (f.t > 160) {
-        falling.splice(i, 1);
-        const k = gi(Math.floor(f.tx / cw), Math.floor(f.ty / ch));
-        if (k >= 0 && !blocked[k]) { leaves.push(makeLeaf(f.tx, f.ty, f.k)); updateCount(); }
-      }
+      const f = falling[i]; if (++f.t >= f.dur) { falling.splice(i, 1); const k = gIndex(f.X, f.z); if (k >= 0 && !blockedG[k] && onSand(f.X, f.z)) { leaves.push(makeLeaf(f.X, f.z, f.k)); updateCount(); } }
     }
     const left = leaves.filter(L => !L.gone).length;
     if (left === 0 && !cleanedToast) { cleanedToast = true; toast('the garden is clean ✿ now rake some patterns'); sfx.chime(); }
@@ -184,151 +194,236 @@
   const countEl = document.getElementById('count');
   function updateCount() { const n = leaves.filter(L => !L.gone).length; countEl.textContent = n ? (innerWidth < 700 ? `${n} leaves` : `${n} leaves to rake`) : 'all clean ✿'; }
 
-  // ---------- tools ----------
-  let tool = 'rake', hover = null, lastDir = 0, dragging = false, lastP = null, rakeSpeed = 0;
-  const TOOL = { rake: { tines: 5 }, fine: { tines: 3 }, smooth: { tines: 4 } };
-  function strokeSegment(x0, y0, x1, y1) {
-    const dx = x1 - x0, dy = y1 - y0, len = Math.hypot(dx, dy);
-    if (len < 0.5) return 0;
-    const ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
-    const a = Math.atan2(dy, dx), A = ((a % Math.PI) + Math.PI) % Math.PI;     // 0..π
-    const dirCode = A < Math.PI / 8 || A > Math.PI * 7 / 8 ? 1 : (A > Math.PI * 3 / 8 && A < Math.PI * 5 / 8) ? 2 : A < Math.PI / 2 ? 4 : 3;
-    const tsp = Math.abs(nx) * cw + Math.abs(ny) * ch;                          // one cell across the rake
-    const half = TOOL[tool].tines * tsp * (tool === 'fine' ? 0.5 : 0.5);
-    const minx = Math.floor((Math.min(x0, x1) - half) / cw) - 1, maxx = Math.ceil((Math.max(x0, x1) + half) / cw) + 1;
-    const miny = Math.floor((Math.min(y0, y1) - half) / ch) - 1, maxy = Math.ceil((Math.max(y0, y1) + half) / ch) + 1;
-    let touched = 0;
-    for (let gy = miny; gy <= maxy; gy++) for (let gx = minx; gx <= maxx; gx++) {
-      const k = gi(gx, gy); if (k < 0 || blocked[k]) continue;
-      const px = (gx + 0.5) * cw - x0, py = (gy + 0.5) * ch - y0;
-      const along = px * ux + py * uy, d = px * nx + py * ny;
-      if (along < -tsp * 0.5 || along > len + tsp * 0.5 || Math.abs(d) > half) continue;
-      if (tool === 'smooth') { if (groove[k]) touched++; groove[k] = 0; continue; }
-      const t = Math.floor((d + half) / tsp + 0.5) % 2;
-      if (groove[k] !== dirCode || ridge[k] !== t) touched++;
-      groove[k] = dirCode; ridge[k] = t;
+  // ---------- raking (all done on the ground, so lines get thinner far away) ----------
+  let tool = 'rake', hover = null, lastDir = 0, dragging = false, lastG = null, rakeSpeed = 0;
+  const TOOL = { rake: { half: 32, sp: 9 }, fine: { half: 14, sp: 5 }, smooth: { half: 30, sp: 9 } };
+  function rakeStroke(a, b) {          // a, b = ground points {X, z}
+    const ax = a.X, ay = gY(a.z), bx = b.X, by = gY(b.z), dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy);
+    if (len < 0.5) return;
+    const ux = dx / len, uy = dy / len, nx = -uy, ny = ux, T = TOOL[tool], half = T.half * WN / 1000 * 1.6, sp = T.sp * WN / 1000 * 1.6;
+    const ang = Math.atan2(dy, dx), code = 1 + ((Math.round(ang / (Math.PI / 8)) % 8) + 8) % 8;   // 8 directions (lines look the same both ways)
+    const minX = Math.min(ax, bx) - half, maxX = Math.max(ax, bx) + half, minY = Math.min(ay, by) - half, maxY = Math.max(ay, by) + half;
+    const u0 = Math.max(0, Math.floor((minX / WN + 0.5) * GW)), u1 = Math.min(GW - 1, Math.ceil((maxX / WN + 0.5) * GW));
+    const v0 = Math.max(0, Math.floor((minY / DEPTH - 1) / (ZF - 1) * GH)), v1 = Math.min(GH - 1, Math.ceil((maxY / DEPTH - 1) / (ZF - 1) * GH));
+    for (let gv = v0; gv <= v1; gv++) for (let gu = u0; gu <= u1; gu++) {
+      const k = gv * GW + gu; if (blockedG[k]) continue;
+      const c = gCenter(k), px = c.X - ax, py = gY(c.z) - ay, along = px * ux + py * uy, d = px * nx + py * ny;
+      if (along < -sp || along > len + sp || Math.abs(d) > half) continue;
+      if (tool === 'smooth') { groove[k] = 0; continue; }
+      groove[k] = code; ridge[k] = Math.floor((d + half) / sp) % 2;
     }
-    // the rake pushes leaves along
+    // the rake pushes leaves along in front of it
     for (const L of leaves) {
       if (L.gone) continue;
-      const px = L.x - x0, py = L.y - y0, along = px * ux + py * uy, d = px * nx + py * ny;
-      if (along > -tsp && along < len + tsp * 2.5 && Math.abs(d) < half + 4) {
-        // carried along in front of the rake (and spilling a little off its sides)
-        const k2 = gi(Math.floor((L.x + dx) / cw), Math.floor((L.y + dy) / ch));
-        if (k2 < 0 || !blocked[k2]) { L.x += dx * 0.92; L.y += dy * 0.92; }
-        L.vx = ux * Math.min(4, len) * 0.35 + nx * Math.sign(d) * 0.2; L.vy = uy * Math.min(4, len) * 0.35 + ny * Math.sign(d) * 0.2;
+      const px = L.X - ax, py = gY(L.z) - ay, along = px * ux + py * uy, d = px * nx + py * ny;
+      if (along > -sp && along < len + sp * 3 && Math.abs(d) < half * 1.1) {
+        const nXp = L.X + dx * 0.92, nz = L.z + (dy * 0.92) / DEPTH, k2 = gIndex(nXp, nz);
+        if (k2 < 0 || !blockedG[k2]) { L.X = nXp; L.z = nz; }
+        L.vx = ux * Math.min(4, len) * 0.3 + nx * Math.sign(d) * 0.2; L.vz = (uy * Math.min(4, len) * 0.3 + ny * Math.sign(d) * 0.2) / DEPTH;
         if (Math.random() < 0.05) sfx.rustle();
       }
     }
-    lastDir = a;
-    return touched;
+    lastDir = ang;
   }
 
   // ---------- drawing ----------
-  const GROOVE_CH = ['', '-', '|', '/', '\\'];
-  function drawRock(r) {
-    const ry = r.r * r.sq * cw / ch;
-    for (let y = Math.floor(r.y - ry - 1); y <= r.y + ry + 1; y++) for (let x = Math.floor(r.x - r.r - 1); x <= r.x + r.r + 1; x++) {
-      const u = (x + 0.5 - r.x) / r.r, v = (y + 0.5 - r.y) / ry, a = Math.atan2(v, u);
-      const edge = 1 + 0.08 * Math.sin(a * 3 + r.bumps[0] * 6) + 0.06 * Math.sin(a * 5 + r.bumps[1] * 6);
-      const d = Math.hypot(u, v) / edge; if (d > 1) continue;
-      const light = -u * 0.5 - v * 0.7;                                     // lit from the top-left
-      const col = d > 0.85 ? '#6d6a66' : light > 0.35 ? '#c9c4bb' : light > 0 ? '#a8a39a' : '#8b867e';
-      const c = d > 0.85 ? 'o' : light > 0.35 ? '@' : d < 0.5 ? '#' : '%';
-      const mossy = v < -0.2 && Math.sin(x * 2.1 + y * 3.7 + r.bumps[2] * 9) > 0.7;
-      put(x, y, mossy ? '"' : c, mossy ? '#89a35a' : col, 300);
-    }
-    // a soft shadow on the sand, bottom right
-    for (let y = Math.floor(r.y - ry); y <= r.y + ry + 2; y++) for (let x = Math.floor(r.x - r.r); x <= r.x + r.r + 2; x++) {
-      const d = Math.hypot((x + 0.5 - r.x - 1.2) / r.r, (y + 0.5 - r.y - 0.8) / ry); if (d < 1.08) shadowCells.push([x, y]);
-    }
+  const SAND = '#e6d5b3', SAND_DK = '#a88d62', SAND_LT = '#fff8ea', HAZE = '#efe3cb';
+  function skyColors() {
+    const top = mix(mix('#141a33', '#9cc4e4', day), '#f2b8a0', warm * 0.5), bot = mix(mix('#3a3150', '#e7f0f4', day), '#ffd39b', warm * 0.7);
+    return [top, bot];
   }
-  function drawTree(t, time) {
-    const ry = t.r * cw / ch;
-    const pal = t.kind === 'pine' ? ['#3f6b3e', '#4f8a4a', '#65a05a', '#87ba6c'] : ['#a93a22', '#d4532b', '#ea7b32', '#f3a845'];
-    const sway = Math.sin(time * 0.0008 + t.seed) * 0.3;
-    for (let y = Math.floor(t.y - ry - 1); y <= t.y + ry + 1; y++) for (let x = Math.floor(t.x - t.r - 1); x <= t.x + t.r + 1; x++) {
-      const u = (x + 0.5 - t.x - sway) / t.r, v = (y + 0.5 - t.y) / ry, a = Math.atan2(v, u);
-      // puffy clumps of leaves (maple) or a star of needles (pine)
-      const lobes = t.kind === 'pine' ? 0.78 + 0.22 * Math.abs(Math.cos(a * 4)) : 0.85 + 0.15 * Math.sin(a * 6 + t.seed) + 0.06 * Math.sin(a * 11);
-      const d = Math.hypot(u, v) / lobes; if (d > 1) continue;
-      const n = Math.sin(x * 1.7 + y * 2.3 + t.seed * 5) * 0.5 + 0.5, light = -u * 0.4 - v * 0.6 + n * 0.3;
-      const col = pal[Math.max(0, Math.min(3, Math.floor((light + 0.6) * 2.4)))];
-      const c = t.kind === 'pine' ? (d > 0.8 ? '*' : n > 0.5 ? '^' : '*') : (d > 0.85 ? '*' : n > 0.6 ? '&' : n > 0.3 ? '%' : '@');
-      put(x, y, c, col, 400);
-    }
-    for (let y = Math.floor(t.y - ry); y <= t.y + ry + 2; y++) for (let x = Math.floor(t.x - t.r); x <= t.x + t.r + 2; x++) {
-      if (Math.hypot((x + 0.5 - t.x - 1.5) / t.r, (y + 0.5 - t.y - 1) / ry) < 1) shadowCells.push([x, y]);
-    }
-  }
-  let shadowCells = [];
-  function draw(time) {
-    cellPri.fill(0); shadowCells = [];
-    // wood around the garden
-    ctx.fillStyle = '#3b2a1e'; ctx.fillRect(0, 0, innerWidth, innerHeight);
-    ctx.fillStyle = SAND; ctx.fillRect(G.x0 * cw, G.y0 * ch, (G.x1 - G.x0 + 1) * cw, (G.y1 - G.y0 + 1) * ch);
-    for (let y = G.y0 - 1; y <= G.y1 + 1; y++) for (let x = G.x0 - 2; x <= G.x1 + 2; x++) {
-      if (x >= G.x0 && x <= G.x1 && y >= G.y0 && y <= G.y1) continue;
-      put(x, y, y === G.y0 - 1 || y === G.y1 + 1 ? '=' : '#', (x + y) % 3 ? FRAME : FRAME_DK, 50);
-    }
-    // the sand: raked grooves, or soft flat sand with tiny specks
-    const W = G.x1 - G.x0 + 1;
-    for (let y = G.y0; y <= G.y1; y++) for (let x = G.x0; x <= G.x1; x++) {
-      const k = (y - G.y0) * W + (x - G.x0);
-      if (groove[k]) put(x, y, GROOVE_CH[groove[k]], ridge[k] ? SAND_LT : SAND_DK, 100);
-      else if (speck[k] < 0.12) put(x, y, speck[k] < 0.04 ? ',' : '.', speck[k] < 0.06 ? '#d4c29e' : '#dccba8', 90);
-    }
-    for (const s of stones) {
-      const ry = s.r * 0.7 * cw / ch;
-      for (let y = Math.floor(s.y - ry); y <= s.y + ry; y++) for (let x = Math.floor(s.x - s.r * 1.2); x <= s.x + s.r * 1.2; x++) {
-        const d = Math.hypot((x + 0.5 - s.x) / (s.r * 1.2), (y + 0.5 - s.y) / ry); if (d > 1) continue;
-        put(x, y, d > 0.72 ? 'o' : d < 0.35 ? '@' : '%', d > 0.72 ? '#8f897f' : d < 0.35 ? '#c8c1b4' : '#b0a99c', 250);
+  function drawBackground(t) {
+    const [top, bot] = skyColors();
+    const g = ctx.createLinearGradient(0, 0, 0, yH); g.addColorStop(0, top); g.addColorStop(1, bot);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, innerWidth, yH + 2);
+    // distant mountains: soft layered shapes
+    if (wallRect) {
+      const base = wallRect.y0 - 3 * ch;
+      for (const far of [true, false]) {
+        ctx.fillStyle = mix(mix(far ? '#b7c6d4' : '#93a7b9', '#262b40', 1 - day), '#e8b49a', warm * 0.35);
+        for (const m of mtns) { if (m.far !== far) continue;
+          ctx.beginPath(); ctx.moveTo(m.x - m.w / 2, base + 2); ctx.quadraticCurveTo(m.x - m.w * 0.15, base - m.h * 1.05, m.x, base - m.h);
+          ctx.quadraticCurveTo(m.x + m.w * 0.18, base - m.h * 0.95, m.x + m.w / 2, base + 2); ctx.fill(); }
       }
     }
-    for (const r of rocks) drawRock(r);
-    for (const m of moss) { const k = gi(m.x, m.y); if (k >= 0 && !blocked[k]) put(m.x, m.y, m.c, m.col, 260); }
+    if (wallRect) { ctx.fillStyle = mix(mix('#e9dcc4', '#3d3746', 1 - day), '#f4cfa0', warm * 0.3); ctx.fillRect(0, wallRect.y0, innerWidth, wallRect.y1 - wallRect.y0); }
+    // ground around the sand: soft moss
+    const gTop = wallRect ? wallRect.y1 : yH;
+    ctx.fillStyle = mix(mix('#2c3a26', '#6f8a4e', day), '#8a7a4a', warm * 0.2); ctx.fillRect(0, gTop, innerWidth, innerHeight - gTop);
+    // sand area (trapezoid)
+    const fl = toScreen(-halfW(), 1), fr = toScreen(halfW(), 1), bl = toScreen(-halfW(), ZF), br = toScreen(halfW(), ZF);
+    const sg = ctx.createLinearGradient(0, bl.y, 0, fl.y);
+    const night = 1 - day;
+    sg.addColorStop(0, mix(mix(HAZE, '#4a4558', night * 0.8), '#f4cf9e', warm * 0.3)); sg.addColorStop(1, mix(mix(SAND, '#5a5262', night * 0.75), '#efc08a', warm * 0.25));
+    ctx.fillStyle = sg; ctx.beginPath(); ctx.moveTo(bl.x, bl.y); ctx.lineTo(br.x, br.y); ctx.lineTo(fr.x, fr.y); ctx.lineTo(fl.x, fl.y); ctx.closePath(); ctx.fill();
+  }
+  function shade(col, z) { const far = (z - 1) / (ZF - 1); return mix(mix(col, HAZE, far * 0.45), '#2a2638', (1 - day) * 0.55); }
+  function drawScene(t) {
+    cellPri.fill(0);
+    // mountains & the garden wall
+    const backY = toScreen(0, ZF).y, mrow = Math.floor(backY / ch);
+    for (const m of mtns) {     // just a few little peaks drawn on top of the soft mountain shapes
+      const base = (mrow - 6) * ch, peak = Math.floor((base - m.h) / ch);
+      put(Math.floor(m.x / cw), peak, '^', mix(m.far ? '#9db0c2' : '#7f93a6', '#1c2133', (1 - day) * 0.7), 6);
+    }
+    // a low clay wall with a tiled roof behind the garden
+    const wallTop = mrow - 6;
+    for (let x = 0; x < cols; x++) {
+      put(x, wallTop, x % 2 ? '_' : '/', mix('#4f4b58', '#1c1b26', (1 - day) * 0.6), 20);
+      put(x, wallTop + 1, x % 2 ? '\\' : '_', mix('#5e5a66', '#1c1b26', (1 - day) * 0.6), 20);
+      put(x, wallTop + 2, x % 4 ? '=' : 'H', mix('#7a7684', '#25232f', (1 - day) * 0.6), 20);
+      for (let y = wallTop + 3; y < mrow; y++) put(x, y, (x * 5 + y * 3) % 13 === 0 ? '.' : (x % 18 === 0 ? '|' : ' '), mix('#bfa98a', '#3a3542', (1 - day) * 0.6), 20);
+    }
+    wallRect = { y0: (wallTop + 3) * ch, y1: mrow * ch };
+    // the sand: grooves and specks, drawn by looking up each screen cell on the ground
+    const y0 = Math.ceil(toScreen(0, ZF).y / ch), y1 = Math.floor(yB / ch);
+    for (let gy = y0; gy <= y1; gy++) {
+      const g = toGround(0, (gy + 0.5) * ch); if (!g) continue;
+      const z = g.z, far = (z - 1) / (ZF - 1);
+      for (let gx = 0; gx < cols; gx++) {
+        const X = ((gx + 0.5) * cw - cx) * z;
+        if (!onSand(X, z)) {
+          // stone edging along the sides and front, moss everywhere else
+          const edge = Math.abs(Math.abs(X) - halfW()) < 12 * z || (z < 1 && z > 0.96 && Math.abs(X) < halfW());
+          if (edge && z <= ZF) put(gx, gy, 'o', shade('#9a948a', z), 80);
+          else if ((gx * 7 + gy * 13) % 9 === 0) put(gx, gy, (gx + gy) % 2 ? '"' : ',', mix(mix('#4d6a3a', '#9ab36a', day), '#1d2a1a', 0), 60);
+          continue;
+        }
+        const k = gIndex(X, z); if (k < 0) continue;
+        if (groove[k]) {
+          // turn the groove's ground direction into a screen direction (perspective)
+          const a = (groove[k] - 1) * Math.PI / 8, dX = Math.cos(a), dY = Math.sin(a), dz = dY / DEPTH;
+          const sx = dX / z - X / (z * z) * dz, sy = -(yB - yH) / (z * z) * dz;
+          let A = Math.atan2(sy, sx); A = ((A % Math.PI) + Math.PI) % Math.PI;
+          const c = A < Math.PI / 8 || A > Math.PI * 7 / 8 ? (far > 0.6 ? '-' : '~') : A > Math.PI * 3 / 8 && A < Math.PI * 5 / 8 ? '|' : A < Math.PI / 2 ? '\\' : '/';
+          put(gx, gy, c, shade(ridge[k] ? SAND_LT : SAND_DK, z), 100);
+        } else if (specks[k] < 0.08 + far * 0.04) put(gx, gy, specks[k] < 0.03 ? ',' : '.', shade('#c9b78f', z), 90);
+      }
+    }
+    // things standing in the garden, drawn back to front
+    const things = [...rocks.map(o => ({ o, kind: 'rock' })), ...trees.map(o => ({ o, kind: 'tree' })), ...(lantern ? [{ o: lantern, kind: 'lantern' }] : [])];
+    things.sort((a, b) => b.o.z - a.o.z);
+    shadows = [];
+    for (const th of things) {
+      const pri = 200 + (1 - (th.o.z - 1) / (ZF - 1)) * 600;
+      if (th.kind === 'rock') drawRock(th.o, pri); else if (th.kind === 'tree') drawTree(th.o, pri, t); else drawLantern(th.o, pri, t);
+    }
     // leaves on the sand
     for (const L of leaves) {
-      const lf = LEAF[L.k];
-      const col = L.gone ? mix(lf.col, SAND, L.gone / 40) : lf.col;
-      put(Math.floor(L.x / cw), Math.floor(L.y / ch), lf.c, col, 350);
+      const p = toScreen(L.X, L.z), lf = LEAF[L.k], pri = 190 + (1 - (L.z - 1) / (ZF - 1)) * 600;
+      put(Math.floor(p.x / cw), Math.floor(p.y / ch), lf.c, L.gone ? mix(lf.col, SAND, L.gone / 40) : shade(lf.col, L.z), pri);
     }
-    for (const t of trees) drawTree(t, time);
-    // leaves drifting down from the maples (they grow as they get "closer" to the sand)
+    // leaves drifting down
     for (const f of falling) {
-      const p = f.t / 160, x = f.x + (f.tx - f.x) * p + Math.sin(f.t * 0.12) * 10, y = f.y + (f.ty - f.y) * p;
-      put(Math.floor(x / cw), Math.floor(y / ch), p < 0.5 ? '.' : LEAF[f.k].c, LEAF[f.k].col, 500);
+      const p = f.t / f.dur, end = toScreen(f.X, f.z);
+      const x = f.sx + (end.x - f.sx) * p + Math.sin(f.t * 0.08 + f.ph) * 14, y = f.sy + (end.y - f.sy) * (p * p * 0.4 + p * 0.6);
+      put(Math.floor(x / cw), Math.floor(y / ch), LEAF[f.k].c, LEAF[f.k].col, 950);
     }
-    // the rake, following your hand
-    if (hover) drawRake(hover.x, hover.y);
+    if (hover) drawRake(hover);
+  }
+  let shadows = [], wallRect = null;
+  function drawRock(r, pri) {
+    const b = toScreen(r.X, r.z), W = r.r / r.z, H = r.r * r.h * 1.1 / r.z;
+    shadows.push({ x: b.x + W * 0.25, y: b.y, rx: W * 1.2, ry: Math.max(3, W * 0.22) });
+    for (let gy = Math.floor((b.y - H * 1.1) / ch); gy <= Math.ceil(b.y / ch); gy++) for (let gx = Math.floor((b.x - W * 1.2) / cw); gx <= Math.ceil((b.x + W * 1.2) / cw); gx++) {
+      const px = (gx + 0.5) * cw, py = (gy + 0.5) * ch;
+      const v = (b.y - py) / H; if (v < -0.08) continue;
+      const u = (px - b.x) / W - r.lean * v;
+      const top = Math.sqrt(Math.max(0, 1 - u * u)) * (1 + 0.1 * Math.sin(u * 4 + r.bump[0]) + 0.06 * Math.sin(u * 9 + r.bump[1]));
+      if (Math.abs(u) > 1 || v > top) continue;
+      const light = -u * 0.55 + (v / Math.max(0.01, top)) * 0.6;
+      const edge = v > top - 0.12 || Math.abs(u) > 0.9;
+      let c = light > 0.55 ? '@' : light > 0.15 ? '%' : light > -0.25 ? '#' : '&', col = light > 0.55 ? '#d2ccc2' : light > 0.15 ? '#aaa59c' : light > -0.25 ? '#86817a' : '#68645e';
+      if (edge) { c = 'o'; col = '#77736c'; }
+      if (r.mossy && v > top - 0.3 && u < 0.4 && Math.sin(gx * 2.1 + gy * 3.3 + r.bump[0]) > 0.2) { c = '"'; col = '#7f9a54'; }
+      put(gx, gy, c, shade(col, r.z), pri);
+    }
+  }
+  function drawTree(tr, pri, t) {
+    const b = toScreen(tr.X, tr.z), S = tr.r / tr.z, sway = Math.sin(t * 0.0008 + tr.seed) * S * 0.05;
+    shadows.push({ x: b.x + S * 0.2, y: b.y, rx: S * 0.9, ry: Math.max(3, S * 0.18) });
+    const trunkH = tr.kind === 'pine' ? S * 0.5 : S * 0.9;
+    // trunk
+    for (let gy = Math.floor((b.y - trunkH) / ch); gy <= Math.floor(b.y / ch); gy++) {
+      const p = (b.y - gy * ch) / trunkH, x = b.x + sway * p + Math.sin(p * 3 + tr.seed) * S * 0.04;
+      put(Math.floor(x / cw), gy, '|', shade('#5a3a26', tr.z), pri + 1);
+      if (S > 40) put(Math.floor(x / cw) + 1, gy, '|', shade('#6e4a30', tr.z), pri + 1);
+    }
+    if (tr.kind === 'maple') {
+      // a few branches and a puffy canopy of red & orange leaves
+      const cyy = b.y - trunkH - S * 0.35, R = S * 0.85;
+      for (const [dx, dy] of [[-0.45, 0.15], [0.45, 0.1], [0, -0.1]]) for (let k = 0; k < 4; k++) put(Math.floor((b.x + dx * S * k / 4) / cw), Math.floor((b.y - trunkH + dy * S - k * 2) / ch), dx < 0 ? '\\' : dx > 0 ? '/' : '|', shade('#5a3a26', tr.z), pri + 1);
+      const pal = ['#9e3420', '#c94a28', '#e2702f', '#f0a040'];
+      for (let gy = Math.floor((cyy - R * 0.75) / ch); gy <= Math.ceil((cyy + R * 0.55) / ch); gy++) for (let gx = Math.floor((b.x - R * 1.35) / cw); gx <= Math.ceil((b.x + R * 1.35) / cw); gx++) {
+        const u = ((gx + 0.5) * cw - b.x - sway) / (R * 1.3), v = ((gy + 0.5) * ch - cyy) / (R * 0.68), a = Math.atan2(v, u);
+        const lobes = 0.82 + 0.12 * Math.sin(a * 5 + tr.seed) + 0.08 * Math.sin(a * 9 + tr.seed * 2);
+        const d = Math.hypot(u, v) / lobes; if (d > 1) continue;
+        const n = Math.sin(gx * 1.9 + gy * 2.7 + tr.seed * 3) * 0.5 + 0.5, light = -u * 0.35 - v * 0.5 + n * 0.35;
+        const c = d > 0.86 ? '*' : n > 0.62 ? '&' : n > 0.3 ? '%' : '@';
+        put(gx, gy, c, shade(pal[Math.max(0, Math.min(3, Math.floor((light + 0.55) * 2.6)))], tr.z), pri + 2);
+      }
+      tr.canopy = { x: b.x, y: cyy, R };
+    } else {
+      // a little pine in three tiers
+      const pal = ['#2f5a33', '#3f7340', '#558c4f', '#73a760'];
+      for (let tier = 0; tier < 3; tier++) {
+        const base = b.y - trunkH - tier * S * 0.42, w = S * (0.95 - tier * 0.25), h = S * 0.55;
+        for (let gy = Math.floor((base - h) / ch); gy <= Math.floor(base / ch); gy++) {
+          const p = (base - gy * ch) / h, hw = w * (1 - p);
+          for (let gx = Math.floor((b.x - hw) / cw); gx <= Math.ceil((b.x + hw) / cw); gx++) {
+            const u = ((gx + 0.5) * cw - b.x - sway * (tier + 1)) / Math.max(1, hw); if (Math.abs(u) > 1) continue;
+            const c = u < -0.8 ? '/' : u > 0.8 ? '\\' : (gx + gy) % 2 ? '^' : '*';
+            put(gx, gy, c, shade(pal[Math.max(0, Math.min(3, Math.floor((-u * 0.5 + p * 0.6 + 0.5) * 3)))], tr.z), pri + 2 + tier);
+          }
+        }
+      }
+    }
+  }
+  function drawLantern(L, pri, t) {
+    const b = toScreen(L.X, L.z), s = Math.max(0.7, 2.6 / L.z);
+    const art = s > 0.9 ? ['  _/^^\\_', ' /______\\', '  |    |', '  | [] |', '  |____|', '    ||', '  [====]'] : [' _/^\\_', ' /___\\', '  |o|', '  |_|', '   |', '  [=]'];
+    const lit = (1 - day) > 0.3 || warm > 0.5;
+    const x0 = Math.floor(b.x / cw) - Math.floor(art[0].length / 2), yy0 = Math.floor(b.y / ch) - art.length + 1;
+    art.forEach((row, r) => { for (let i = 0; i < row.length; i++) if (row[i] !== ' ') {
+      const glow = lit && (row[i] === '[' || row[i] === ']' || row[i] === 'o') && r >= 2 && r <= 3;
+      put(x0 + i, yy0 + r, row[i], glow ? '#ffd27a' : shade(r < 2 ? '#6f6a62' : '#857f75', L.z), pri); } });
+    if (lit) lanternGlow = { x: b.x, y: (yy0 + 3) * ch, r: 60 * s };
+    else lanternGlow = null;
+    shadows.push({ x: b.x + 4, y: b.y, rx: 18 * s, ry: 4 });
+  }
+  let lanternGlow = null;
+  function drawRake(p) {
+    const g = toGround(p.x, p.y); if (!g) return;
+    const T = TOOL[tool], half = T.half * WN / 1000 * 1.6, a = lastDir, nx = -Math.sin(a), ny = Math.cos(a);
+    // the rake head lies on the ground, so it shrinks with distance too
+    const n = 7;
+    for (let k = -n; k <= n; k++) {
+      const off = half * k / n, gX = g.X + nx * off, gz = g.z + ny * off / DEPTH, s = toScreen(gX, gz);
+      put(Math.floor(s.x / cw), Math.floor(s.y / ch), tool === 'smooth' ? '=' : (k % 2 === 0 ? 'H' : '='), tool === 'smooth' ? '#e6d5b3' : '#6e4a2e', 990);
+    }
+    // the handle comes up toward you
+    const s0 = toScreen(g.X, g.z);
+    for (let k = 1; k <= 12; k++) put(Math.floor((s0.x + k * cw * 0.6) / cw), Math.floor((s0.y + k * ch * 0.75) / ch), '\\', '#a2774e', 985);
+  }
 
-    // shadows first, then all the characters
-    for (const o of [...rocks, ...trees]) {
-      const x = (o.x + 1.4) * cw, y = (o.y + 0.9) * ch, rx = o.r * cw * 1.05, ry = o.r * cw * (o.sq || 1) * 1.05;
-      const g = ctx.createRadialGradient(x, y, 0, x, y, rx);
-      g.addColorStop(0, 'rgba(110, 85, 50, .22)'); g.addColorStop(0.7, 'rgba(110, 85, 50, .12)'); g.addColorStop(1, 'rgba(110, 85, 50, 0)');
-      ctx.save(); ctx.translate(x, y); ctx.scale(1, ry / rx); ctx.translate(-x, -y); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, rx, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+  function render(t) {
+    drawBackground(t);
+    drawScene(t);
+    // soft contact shadows under everything
+    for (const s of shadows) {
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, s.rx);
+      g.addColorStop(0, 'rgba(90, 70, 40, .28)'); g.addColorStop(1, 'rgba(90, 70, 40, 0)');
+      ctx.save(); ctx.translate(s.x, s.y); ctx.scale(1, s.ry / s.rx); ctx.translate(-s.x, -s.y); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(s.x, s.y, s.rx, 0, 7); ctx.fill(); ctx.restore();
     }
     const buckets = new Map();
     for (let i = 0; i < cellPri.length; i++) { if (cellPri[i] <= 0) continue; let b = buckets.get(cellCol[i]); if (!b) buckets.set(cellCol[i], b = []); b.push(i); }
     for (const [col, arr] of buckets) { ctx.fillStyle = col; for (const i of arr) ctx.fillText(cellCh[i], (i % cols) * cw, Math.floor(i / cols) * ch); }
-    // a soft warm light over the garden
-    const g = ctx.createRadialGradient(innerWidth * 0.3, innerHeight * 0.2, 0, innerWidth * 0.3, innerHeight * 0.2, innerWidth * 0.9);
-    g.addColorStop(0, 'rgba(255, 240, 210, .10)'); g.addColorStop(1, 'rgba(60, 40, 20, .12)');
+    if (lanternGlow) { const g = ctx.createRadialGradient(lanternGlow.x, lanternGlow.y, 0, lanternGlow.x, lanternGlow.y, lanternGlow.r * 2.4);
+      g.addColorStop(0, 'rgba(255, 200, 110, .35)'); g.addColorStop(1, 'rgba(255, 200, 110, 0)'); ctx.fillStyle = g; ctx.fillRect(lanternGlow.x - lanternGlow.r * 2.4, lanternGlow.y - lanternGlow.r * 2.4, lanternGlow.r * 4.8, lanternGlow.r * 4.8); }
+    // warm light over everything
+    const g = ctx.createRadialGradient(innerWidth * 0.3, 0, 0, innerWidth * 0.3, 0, innerWidth);
+    g.addColorStop(0, `rgba(255, 238, 205, ${0.1 * day})`); g.addColorStop(1, 'rgba(40, 30, 20, .1)');
     ctx.fillStyle = g; ctx.fillRect(0, 0, innerWidth, innerHeight);
-  }
-  function drawRake(x, y) {
-    const gx = Math.floor(x / cw), gy = Math.floor(y / ch);
-    const a = lastDir, nx = -Math.sin(a), ny = Math.cos(a), n = TOOL[tool].tines;
-    const tsp = Math.abs(nx) * cw + Math.abs(ny) * ch;
-    const head = tool === 'smooth' ? '=' : (Math.abs(nx) > Math.abs(ny) ? '-' : '|');
-    const tine = tool === 'smooth' ? '=' : 'E';
-    for (let k = -n; k <= n; k++) {
-      const off = k * tsp * 0.5;
-      put(Math.floor((x + nx * off) / cw), Math.floor((y + ny * off) / ch), k % 2 === 0 ? (tool === 'smooth' ? '=' : 'H') : head, tool === 'smooth' ? '#d9c79f' : '#7a5232', 900);
-    }
-    // the handle, trailing behind the head
-    for (let k = 1; k <= 9; k++) put(Math.floor((x - Math.cos(a) * k * cw * 0.9 - 4) / cw), Math.floor((y - Math.sin(a) * k * ch * 0.6 - 4) / ch), '#', '#a2774e', 890);
   }
 
   // ---------- sound (all made in the browser) ----------
@@ -395,15 +490,23 @@
   vol.addEventListener('input', () => { prefs.volume = +vol.value; save(); applySound(); });
   let lastVol = prefs.volume || 0.6;
 
+
+
   // ---------- saving ----------
   let saveTimer = null;
   function save() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      let g = ''; for (let i = 0; i < groove.length; i++) g += String.fromCharCode(48 + (groove[i] << 1 | ridge[i]));
-      try { localStorage.setItem(STORE, JSON.stringify({ prefs, garden: { cols, rows, seed: prefs.seed, g,
-        leaves: leaves.filter(L => !L.gone).map(L => ({ x: +(L.x / cw).toFixed(2), y: +(L.y / ch).toFixed(2), k: L.k })) } })); } catch (e) {}
+      let g = ''; for (let i = 0; i < groove.length; i++) g += String.fromCharCode(48 + groove[i] * 2 + ridge[i]);
+      try { localStorage.setItem(STORE, JSON.stringify({ prefs, garden: { seed: prefs.seed, g, leaves: leaves.filter(L => !L.gone).map(L => ({ X: +(L.X / WN).toFixed(4), z: +L.z.toFixed(3), k: L.k })) } })); } catch (e) {}
     }, 400);
+  }
+  function restore() {
+    const gd = saved.garden;
+    if (gd && gd.seed === prefs.seed && gd.g && gd.g.length === groove.length) {
+      for (let i = 0; i < groove.length; i++) { const v = gd.g.charCodeAt(i) - 48; groove[i] = v >> 1; ridge[i] = v & 1; }
+      for (const L of gd.leaves || []) leaves.push(makeLeaf(L.X * WN, L.z, L.k));
+    } else scatterLeaves(innerWidth < 700 ? 30 : 55);
   }
 
   // ---------- toast & clock ----------
@@ -415,12 +518,14 @@
     clockEl.textContent = `${h}:${String(d.getMinutes()).padStart(2, '0')} ${ap}` + (innerWidth < 700 ? '' : ` · ${DAYS[d.getDay()]}`); }
   tick(); setInterval(tick, 10000);
 
+
+
   // ---------- loop ----------
-  let t0 = 0;
   function frame(now) {
+    if (Math.floor(now / 30000) !== Math.floor((now - 16) / 30000)) { day = daylight(); warm = Math.min(1, warmth()); }
     updateLeaves();
     rakeSpeed *= 0.85; if (actx) setScratch(rakeSpeed);
-    draw(now);
+    render(now);
     requestAnimationFrame(frame);
   }
   resize(); addEventListener('resize', resize);
@@ -430,20 +535,27 @@
   // ---------- input ----------
   canvas.addEventListener('pointerdown', e => {
     if (prefs.volume > 0) applySound();
-    dragging = true; lastP = { x: e.clientX, y: e.clientY }; hover = { ...lastP };
+    dragging = true; hover = { x: e.clientX, y: e.clientY }; lastG = toGround(e.clientX, e.clientY);
     canvas.setPointerCapture(e.pointerId);
   });
   canvas.addEventListener('pointermove', e => {
-    const p = { x: e.clientX, y: e.clientY };
-    hover = p;
-    if (!dragging || !lastP) return;
-    const d = Math.hypot(p.x - lastP.x, p.y - lastP.y);
+    const p = { x: e.clientX, y: e.clientY }; hover = p;
+    if (!dragging) return;
+    const g = toGround(p.x, p.y); if (!g) return;
+    if (!lastG) { lastG = g; return; }
+    const d = Math.hypot(g.X - lastG.X, (g.z - lastG.z) * DEPTH);
     if (d < 2) return;
-    strokeSegment(lastP.x, lastP.y, p.x, p.y);
-    rakeSpeed = Math.max(rakeSpeed * 0.6, d);
-    lastP = p;
+    // split long moves into small steps so the lines stay smooth
+    const steps = Math.ceil(d / 12);
+    for (let k = 1; k <= steps; k++) {
+      const a = { X: lastG.X + (g.X - lastG.X) * (k - 1) / steps, z: lastG.z + (g.z - lastG.z) * (k - 1) / steps };
+      const b = { X: lastG.X + (g.X - lastG.X) * k / steps, z: lastG.z + (g.z - lastG.z) * k / steps };
+      rakeStroke(a, b);
+    }
+    rakeSpeed = Math.max(rakeSpeed * 0.6, Math.hypot(p.x - (hover.px || p.x), 0) + d / Math.max(1, g.z) * 0.6);
+    lastG = g;
   });
-  const end = () => { if (dragging) save(); dragging = false; lastP = null; };
+  const end = () => { if (dragging) save(); dragging = false; lastG = null; };
   canvas.addEventListener('pointerup', end); canvas.addEventListener('pointercancel', end);
   canvas.addEventListener('pointerleave', () => { if (!dragging) hover = null; });
 
@@ -452,14 +564,9 @@
     toast({ rake: 'rake: wide, calm lines', fine: 'fine rake: thin little lines', smooth: 'smooth: flatten the sand' }[t]);
   }
   document.querySelectorAll('[data-tool]').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
-  document.getElementById('leavesBtn').addEventListener('click', () => {
-    const W = G.x1 - G.x0 + 1, H = G.y1 - G.y0 + 1;
-    scatterLeaves(Math.round(W * H / 170)); updateCount(); save(); toast('a gust of wind… fresh leaves!'); sfx.rustle(); sfx.rustle();
-  });
+  document.getElementById('leavesBtn').addEventListener('click', () => { scatterLeaves(innerWidth < 700 ? 22 : 40); updateCount(); save(); toast('a gust of wind… fresh leaves!'); sfx.rustle(); sfx.rustle(); });
   document.getElementById('resetBtn').addEventListener('click', () => {
-    groove.fill(0); ridge.fill(0); leaves.length = 0;
-    const W = G.x1 - G.x0 + 1, H = G.y1 - G.y0 + 1; scatterLeaves(Math.round(W * H / 150)); updateCount(); save();
-    toast('fresh, smooth sand'); sfx.chime();
+    groove.fill(0); ridge.fill(0); leaves.length = 0; scatterLeaves(innerWidth < 700 ? 30 : 55); updateCount(); save(); toast('fresh, smooth sand'); sfx.chime();
   });
   addEventListener('keydown', e => {
     const k = e.key.toLowerCase();

@@ -1,6 +1,6 @@
 # ASCII Zen Garden
 
-A calm little sand garden drawn entirely with text characters. Rake the fallen leaves off the sand, then rake patterns around the rocks, the little maple trees and the pine. Your garden is saved in your browser, so it's still there when you come back.
+A calm little sand garden drawn entirely with text characters, seen from the front: the sand stretches back toward a garden wall and the mountains, with rocks, little maple trees, a pine and a stone lantern standing in it. Rake the fallen leaves off the sand, then rake patterns around the rocks, the little maple trees and the pine. Your garden is saved in your browser, so it's still there when you come back.
 
 ## Controls
 
